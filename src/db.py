@@ -6,18 +6,9 @@ from numpy import byte
 
 @dataclass
 class Row:
-    id: int
-    username: str
-    email: str
-
-@dataclass
-class Statement:
-    statement_type: StatementType
-    row_to_insert: Row
-
-    def __init__(self):
-        self.statement_type = None
-        self.row_to_insert = None
+    id: int = 0
+    username: str = ""
+    email: str = ""
 
 ID_SIZE = 4
 USERNAME_SIZE = 32
@@ -34,7 +25,6 @@ TABLE_MAX_PAGES = 100
 ROWS_PER_PAGE = PAGE_SIZE // ROW_SIZE
 TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES
 
-@dataclass
 class Table:
     num_rows: int
     pages: list[bytearray | None]
@@ -42,11 +32,6 @@ class Table:
     def __init__(self):
         self.num_rows = 0
         self.pages = [None] * TABLE_MAX_PAGES
-    
-    def free_table(self):
-        self.pages = [None] * TABLE_MAX_PAGES
-        self.num_rows = 0
-        return
 
 class MetaCommandResult(Enum):
     META_COMMAND_SUCCESS = 0
@@ -56,6 +41,8 @@ class PrepareResult(Enum):
     PREPARE_SUCCESS = 0
     PREPARE_UNRECOGNIZED_STATEMENT = 1
     PREPARE_SYNTAX_ERROR = 2
+    PREPARE_STRING_TOO_LONG = 3
+    PREPARE_NEGATIVE_ID = 4
 
 class ExecuteResult(Enum):
     EXECUTE_SUCCESS = 0
@@ -65,24 +52,25 @@ class StatementType(Enum):
     STATEMENT_INSERT = 0
     STATEMENT_SELECT = 1
 
+@dataclass
+class Statement:
+    statement_type: StatementType = None
+    row_to_insert: Row = None
+
+
+
 def serialize_row(source: Row, destination: bytearray, byte_offset: int):
-    offset = byte_offset
-    destination[offset+ID_OFFSET:offset+ID_OFFSET+ID_SIZE] = source.id.to_bytes(ID_SIZE, "little")
-    offset += ID_SIZE
-    destination[offset+USERNAME_OFFSET:offset+USERNAME_OFFSET+USERNAME_SIZE] = source.username.encode("utf-8")
-    offset += USERNAME_SIZE
-    destination[offset+EMAIL_OFFSET:offset+EMAIL_OFFSET+EMAIL_SIZE] = source.email.encode("utf-8")
-    offset += EMAIL_SIZE
+    base = byte_offset
+    destination[base+ID_OFFSET:base+ID_OFFSET+ID_SIZE] = source.id.to_bytes(ID_SIZE, "little").ljust(ID_SIZE, b"\x00")
+    destination[base+USERNAME_OFFSET:base+USERNAME_OFFSET+USERNAME_SIZE] = source.username.encode("utf-8").ljust(USERNAME_SIZE, b"\x00")
+    destination[base+EMAIL_OFFSET:base+EMAIL_OFFSET+EMAIL_SIZE] = source.email.encode("utf-8").ljust(EMAIL_SIZE, b"\x00")
     return
 
 def deserialize_row(source: bytearray, destination: Row, byte_offset: int):
-    offset = byte_offset
-    destination.id = int.from_bytes(source[offset+ID_OFFSET:offset+ID_OFFSET+ID_SIZE], "little")
-    offset += ID_SIZE
-    destination.username = source[offset+USERNAME_OFFSET:offset+USERNAME_OFFSET+USERNAME_SIZE].decode("utf-8")
-    offset += USERNAME_SIZE
-    destination.email = source[offset+EMAIL_OFFSET:offset+EMAIL_OFFSET+EMAIL_SIZE].decode("utf-8")
-    offset += EMAIL_SIZE
+    base = byte_offset
+    destination.id = int.from_bytes(source[base+ID_OFFSET:base+ID_OFFSET+ID_SIZE].strip(b"\x00"), "little")
+    destination.username = source[base+USERNAME_OFFSET:base+USERNAME_OFFSET+USERNAME_SIZE].strip(b"\x00").decode("utf-8")
+    destination.email = source[base+EMAIL_OFFSET:base+EMAIL_OFFSET+EMAIL_SIZE].strip(b"\x00").decode("utf-8")
     return 
 
 def row_slot(table: Table, row_num: int):
@@ -93,6 +81,7 @@ def row_slot(table: Table, row_num: int):
         table.pages[page_num] = page
     offset = row_num % ROWS_PER_PAGE
     byte_offset = offset * ROW_SIZE
+    # print(f"page: {page}")
     return page, byte_offset
 
 def do_meta_command(meta_command: str) -> None:
@@ -106,6 +95,12 @@ def prepare_statement(command: str, args: list[str], statement: Statement):
         statement.statement_type = StatementType.STATEMENT_INSERT
         if not args[0].isdigit():
             return PrepareResult.PREPARE_SYNTAX_ERROR
+        if int(args[0]) < 0:
+            return PrepareResult.PREPARE_NEGATIVE_ID
+        if len(args[1]) > USERNAME_SIZE:
+            return PrepareResult.PREPARE_STRING_TOO_LONG
+        if len(args[2]) > EMAIL_SIZE:
+            return PrepareResult.PREPARE_STRING_TOO_LONG
         statement.row_to_insert = Row(id=int(args[0]), username=args[1], email=args[2])
         if len(args) != 3:
             return PrepareResult.PREPARE_SYNTAX_ERROR
@@ -130,7 +125,7 @@ def execute_select(statement: Statement, table: Table):
         page, byte_offset = row_slot(table, row_num)
         row = Row(id=0, username="", email="")
         deserialize_row(page, row, byte_offset)
-        print(f"({row_num}: {row.id}, {row.username}, {row.email})")
+        print(f"({row.id}, {row.username}, {row.email})")
     return ExecuteResult.EXECUTE_SUCCESS
 
 def execute_statement(statement: Statement, table: Table):
@@ -169,6 +164,12 @@ def main():
                 continue
             case PrepareResult.PREPARE_UNRECOGNIZED_STATEMENT:
                 print(f"Unrecognized keyword at start of \'{command} {str.join(" ", args)}\'.")
+                continue
+            case PrepareResult.PREPARE_STRING_TOO_LONG:
+                print(f"String is too long.")
+                continue
+            case PrepareResult.PREPARE_NEGATIVE_ID:
+                print(f"ID must be positive.")
                 continue
         
         match execute_statement(statement, table):
