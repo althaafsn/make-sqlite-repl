@@ -37,6 +37,12 @@ class Table:
     num_rows: int
     pager: Pager
 
+@dataclass
+class Cursor:
+    table: Table
+    row_num: int
+    end_of_table: bool
+
 class MetaCommandResult(Enum):
     META_COMMAND_SUCCESS = 0
     META_COMMAND_UNRECOGNIZED_COMMAND = 1
@@ -61,6 +67,19 @@ class Statement:
     statement_type: StatementType = None
     row_to_insert: Row = None
 
+def table_start(table: Table):
+    return Cursor(table=table, row_num=0, end_of_table=table.num_rows == 0)
+
+def table_end(table: Table):
+    return Cursor(table=table, row_num=table.num_rows, end_of_table=True)   
+
+def cursor_advance(cursor: Cursor):
+    cursor.row_num += 1
+    if cursor.row_num >= cursor.table.num_rows:
+        cursor.end_of_table = True
+    return
+
+
 def pager_open(filename: str):
     file_descriptor = os.open(filename, os.O_RDWR | os.O_CREAT, 0o600)
     if file_descriptor == -1:
@@ -72,7 +91,7 @@ def pager_open(filename: str):
 
 def db_open(filename: str):
     pager = pager_open(filename)
-    num_rows = pager.file_length // ROW_SIZE
+    num_rows = (pager.file_length // PAGE_SIZE) * ROWS_PER_PAGE + (pager.file_length % PAGE_SIZE) // ROW_SIZE
 
     table = Table(pager=pager, num_rows=num_rows)
     # print(f"table.num_rows: {table.num_rows}")
@@ -136,7 +155,6 @@ def db_close(table: Table):
         page_num = num_full_pages
         if pager.pages[page_num] is not None:
             pager_flush(pager, page_num, num_additional_rows * ROW_SIZE)
-            # print(f"pager.pages[page_num]: {pager.pages[page_num]}")
             pager.pages[page_num] = None
     
     result = os.close(pager.file_descriptor)
@@ -161,12 +179,12 @@ def deserialize_row(source: bytearray, destination: Row, byte_offset: int):
     destination.email = source[base+EMAIL_OFFSET:base+EMAIL_OFFSET+EMAIL_SIZE].strip(b"\x00").decode("utf-8")
     return 
 
-def row_slot(table: Table, row_num: int):
+def cursor_value(cursor: Cursor):
+    row_num = cursor.row_num
     page_num = row_num // ROWS_PER_PAGE
-    page = get_page(table.pager, page_num)
+    page = get_page(cursor.table.pager, page_num)
     offset = row_num % ROWS_PER_PAGE
     byte_offset = offset * ROW_SIZE
-    # print(f"page: {page}")
     return page, byte_offset
 
 def do_meta_command(meta_command: str, table: Table) -> None:
@@ -201,20 +219,20 @@ def execute_insert(statement: Statement, table: Table):
     if table.num_rows >= TABLE_MAX_ROWS:
         return ExecuteResult.EXECUTE_TABLE_FULL
     row_to_insert = statement.row_to_insert
-    page, byte_offset = row_slot(table, table.num_rows)
-    # print("row_to_insert: ", row_to_insert)
-    # print("Page before: ", page)
+    cursor = table_end(table)
+    page, byte_offset = cursor_value(cursor)
     serialize_row(row_to_insert, page, byte_offset)
-    # print("Page after:", page)
     table.num_rows += 1
     return ExecuteResult.EXECUTE_SUCCESS
 
 def execute_select(statement: Statement, table: Table):
-    for row_num in range(table.num_rows):
-        page, byte_offset = row_slot(table, row_num)
+    cursor = table_start(table)
+    while not cursor.end_of_table:
         row = Row(id=0, username="", email="")
+        page, byte_offset = cursor_value(cursor)
         deserialize_row(page, row, byte_offset)
         print(f"({row.id}, {row.username}, {row.email})")
+        cursor_advance(cursor)
     return ExecuteResult.EXECUTE_SUCCESS
 
 def execute_statement(statement: Statement, table: Table):

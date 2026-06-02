@@ -14,7 +14,7 @@ class TestDB:
 
     def run_script(self, commands: list[str]) -> str[str]:
         proc = subprocess.Popen(
-            [PYTHON, str(DB_SCRIPT), "test.db"],
+            [PYTHON, str(DB_SCRIPT), "db.db"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -61,7 +61,7 @@ class TestDB:
         input.append(".exit")
         result = self.run_script(input)
         print(result)
-        os.remove("test.db")
+        # os.remove("test.db")
 
     def test_insert_overflow_username(self):
         input = []
