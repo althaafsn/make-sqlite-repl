@@ -1,6 +1,6 @@
 # import pytest
 
-import src.main as main
+import src.db as main
 
 class TestDB:
     def test_insert_and_select(self):

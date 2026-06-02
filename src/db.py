@@ -1,4 +1,5 @@
 import sys
+import os
 from enum import Enum
 from dataclasses import dataclass
 
@@ -25,13 +26,16 @@ TABLE_MAX_PAGES = 100
 ROWS_PER_PAGE = PAGE_SIZE // ROW_SIZE
 TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES
 
-class Table:
-    num_rows: int
+@dataclass
+class Pager:
+    file_descriptor: int
+    file_length: int
     pages: list[bytearray | None]
 
-    def __init__(self):
-        self.num_rows = 0
-        self.pages = [None] * TABLE_MAX_PAGES
+@dataclass
+class Table:
+    num_rows: int
+    pager: Pager
 
 class MetaCommandResult(Enum):
     META_COMMAND_SUCCESS = 0
@@ -57,6 +61,90 @@ class Statement:
     statement_type: StatementType = None
     row_to_insert: Row = None
 
+def pager_open(filename: str):
+    file_descriptor = os.open(filename, os.O_RDWR | os.O_CREAT, 0o600)
+    if file_descriptor == -1:
+        print(f"Error: Could not open file \'{filename}\'.")
+        sys.exit(1)
+    file_length = os.fstat(file_descriptor).st_size
+    pager = Pager(file_descriptor=file_descriptor, file_length=file_length, pages=[None] * TABLE_MAX_PAGES)
+    return pager
+
+def db_open(filename: str):
+    pager = pager_open(filename)
+    num_rows = pager.file_length // ROW_SIZE
+
+    table = Table(pager=pager, num_rows=num_rows)
+    # print(f"table.num_rows: {table.num_rows}")
+    return table
+
+def get_page(pager: Pager, page_num: int):
+    if page_num > TABLE_MAX_PAGES:
+        print(f"Tried to fetch page number out of bounds. {page_num} > {TABLE_MAX_PAGES}")
+        sys.exit(1)
+
+    if pager.pages[page_num] is None:
+        pager.pages[page_num] = bytearray(PAGE_SIZE)
+        # print(f"pager.pages[page_num]: {pager.pages[page_num]}")
+        num_pages = pager.file_length // PAGE_SIZE
+        # print("num_pages: ", num_pages)
+        if pager.file_length % PAGE_SIZE:
+            num_pages += 1
+        if page_num <= num_pages:
+            os.lseek(pager.file_descriptor, page_num * PAGE_SIZE, os.SEEK_SET)
+            
+            bytes_read = os.read(pager.file_descriptor, PAGE_SIZE)
+            if bytes_read == -1:
+                print(f"Error reading file. {os.strerror(os.errno)}")
+                sys.exit(1)
+            pager.pages[page_num] = bytearray(bytes_read)
+            # print(f"pager.[page_num] after bytes_read: {pager.pages[page_num]}")
+
+    return pager.pages[page_num]
+
+def pager_flush(pager: Pager, page_num: int, size: int):
+    if pager.pages[page_num] is None:
+        print(f"Tried to flush null page.")
+        sys.exit(1)
+    
+    offset = os.lseek(pager.file_descriptor, page_num * PAGE_SIZE, os.SEEK_SET)
+    if offset == -1:
+        print(f"Error seeking. {os.strerror(os.errno)}")
+        sys.exit(1)
+        
+    result = os.write(pager.file_descriptor, pager.pages[page_num][:size])
+    if result == -1:
+        print(f"Error writing. {os.strerror(os.errno)}")
+        sys.exit(1)
+    return
+
+
+def db_close(table: Table):
+    pager = table.pager
+    num_full_pages = table.num_rows // ROWS_PER_PAGE
+    # print(f"num_full_pages: {num_full_pages}")
+
+    for i in range(num_full_pages):
+        if pager.pages[i] is None:
+            continue
+        pager_flush(pager, i, PAGE_SIZE)
+        pager.pages[i] = None
+
+    num_additional_rows = table.num_rows % ROWS_PER_PAGE
+    # print(f"num_additional_rows: {num_additional_rows}")
+    if num_additional_rows > 0:
+        page_num = num_full_pages
+        if pager.pages[page_num] is not None:
+            pager_flush(pager, page_num, num_additional_rows * ROW_SIZE)
+            # print(f"pager.pages[page_num]: {pager.pages[page_num]}")
+            pager.pages[page_num] = None
+    
+    result = os.close(pager.file_descriptor)
+    if result == -1:
+        print(f"Error closing file. {os.strerror(os.errno)}")
+        sys.exit(1)
+    
+    return
 
 
 def serialize_row(source: Row, destination: bytearray, byte_offset: int):
@@ -75,17 +163,15 @@ def deserialize_row(source: bytearray, destination: Row, byte_offset: int):
 
 def row_slot(table: Table, row_num: int):
     page_num = row_num // ROWS_PER_PAGE
-    page = table.pages[page_num]
-    if page is None:
-        page = bytearray(PAGE_SIZE)
-        table.pages[page_num] = page
+    page = get_page(table.pager, page_num)
     offset = row_num % ROWS_PER_PAGE
     byte_offset = offset * ROW_SIZE
     # print(f"page: {page}")
     return page, byte_offset
 
-def do_meta_command(meta_command: str) -> None:
+def do_meta_command(meta_command: str, table: Table) -> None:
     if meta_command == ".exit":
+        db_close(table)
         sys.exit(0)
     else:
         return MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND
@@ -116,7 +202,10 @@ def execute_insert(statement: Statement, table: Table):
         return ExecuteResult.EXECUTE_TABLE_FULL
     row_to_insert = statement.row_to_insert
     page, byte_offset = row_slot(table, table.num_rows)
+    # print("row_to_insert: ", row_to_insert)
+    # print("Page before: ", page)
     serialize_row(row_to_insert, page, byte_offset)
+    # print("Page after:", page)
     table.num_rows += 1
     return ExecuteResult.EXECUTE_SUCCESS
 
@@ -138,8 +227,13 @@ def execute_statement(statement: Statement, table: Table):
 def print_prompt():
     print("db > ", end="")
 
-def main():
-    table = Table()
+def main(args: list[str]):
+    if len(args) == 0:
+        print("Must supply a database filename.")
+        sys.exit(1)
+    filename = args[0]
+    table = db_open(filename)
+
     while True:
         print_prompt()
         arg = input()
@@ -148,7 +242,7 @@ def main():
         args = arg.split(" ")[1:]
 
         if command[0] == ".":
-            match do_meta_command(command):
+            match do_meta_command(command, table):
                 case MetaCommandResult.META_COMMAND_SUCCESS:
                     continue
                 case MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND:
@@ -179,4 +273,4 @@ def main():
                 print("Error: Table full.")
         
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

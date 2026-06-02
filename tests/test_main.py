@@ -1,6 +1,7 @@
 import pytest
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 import src.db as db
@@ -13,7 +14,7 @@ class TestDB:
 
     def run_script(self, commands: list[str]) -> str[str]:
         proc = subprocess.Popen(
-            [PYTHON, str(DB_SCRIPT)],
+            [PYTHON, str(DB_SCRIPT), "test.db"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -36,6 +37,8 @@ class TestDB:
             ])
 
         print(result)
+        os.remove("test.db")
+        
 
     def test_insert_and_select_multiple(self):
         result = self.run_script([
@@ -46,6 +49,7 @@ class TestDB:
                 ".exit",
             ])
         print(result)
+        os.remove("test.db")
 
     def test_insert_and_select_overflow(self):
         input = []
@@ -57,6 +61,7 @@ class TestDB:
         input.append(".exit")
         result = self.run_script(input)
         print(result)
+        os.remove("test.db")
 
     def test_insert_overflow_username(self):
         input = []
@@ -65,6 +70,7 @@ class TestDB:
         input.append(".exit")
         result = self.run_script(input)
         print(result)
+        os.remove("test.db")
 
     def test_insert_overflow_email(self):
         input = []
@@ -73,3 +79,20 @@ class TestDB:
         input.append(".exit")
         result = self.run_script(input)
         print(result)
+        os.remove("test.db")
+
+    def test_insert_persistence(self):
+        input = []
+        input.append("insert 1 foo bar")
+        input.append("insert 2 foo bar")
+        input.append("select")
+        input.append(".exit")
+        result = self.run_script(input)
+        print(result)
+        input = []
+        input.append("select")
+        input.append(".exit")
+        result = self.run_script(input)
+        print(result)
+        fd = os.open("test.db", os.O_RDONLY)
+        print(os.read(fd, os.fstat(fd).st_size))
