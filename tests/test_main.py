@@ -112,3 +112,24 @@ class TestDB:
         result = self.run_script(input)
         print(result)
         os.remove("test.db")
+
+    def test_btree_insert(self):
+        input = []
+        input.append("insert 3 foo bar")
+        input.append("insert 2 foo bar")
+        input.append("insert 1 foo bar")
+        input.append(".btree")
+        input.append(".exit")
+        result = self.run_script(input)
+        print(result)
+        os.remove("test.db")
+
+    def test_insert_duplicate_key(self):
+        input = []
+        input.append("insert 1 foo bar")
+        input.append("insert 1 foo bar")
+        input.append(".btree")
+        input.append(".exit")
+        result = self.run_script(input)
+        print(result)
+        os.remove("test.db")
