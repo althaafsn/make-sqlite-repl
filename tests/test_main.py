@@ -96,3 +96,19 @@ class TestDB:
         print(result)
         fd = os.open("test.db", os.O_RDONLY)
         print(os.read(fd, os.fstat(fd).st_size))
+
+    def test_constants(self):
+        input = []
+        input.append(".constants")
+        input.append(".exit")
+        result = self.run_script(input)
+        print(result)
+        os.remove("test.db")
+
+    def test_btree(self):
+        input = []
+        input.append(".btree")
+        input.append(".exit")
+        result = self.run_script(input)
+        print(result)
+        os.remove("test.db")

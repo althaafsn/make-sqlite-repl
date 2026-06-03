@@ -23,24 +23,49 @@ ENTRY_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE
 
 PAGE_SIZE = 4096
 TABLE_MAX_PAGES = 100
-ROWS_PER_PAGE = PAGE_SIZE // ROW_SIZE
-TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES
+
+
+# Common Node Header Layout
+NODE_TYPE_SIZE = 1
+NODE_TYPE_OFFSET = 0
+IS_ROOT_SIZE = 1
+IS_ROOT_OFFSET = NODE_TYPE_OFFSET + NODE_TYPE_SIZE
+PARENT_POINTER_SIZE = 4
+PARENT_POINTER_OFFSET = IS_ROOT_OFFSET + IS_ROOT_SIZE
+COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE
+
+# Leaf Node Header Layout
+LEAF_NODE_NUM_CELLS_SIZE = 4
+LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE
+LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE
+
+# Leaf Node Body Layout
+LEAF_NODE_KEY_SIZE = 4
+LEAF_NODE_KEY_OFFSET = 0
+LEAF_NODE_VALUE_SIZE = ROW_SIZE
+LEAF_NODE_VALUE_OFFSET = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE
+LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE
+LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE
+LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS // LEAF_NODE_CELL_SIZE
+
 
 @dataclass
 class Pager:
+    num_pages: int
     file_descriptor: int
     file_length: int
     pages: list[bytearray | None]
 
 @dataclass
 class Table:
-    num_rows: int
+    root_page_num: int
     pager: Pager
 
 @dataclass
 class Cursor:
     table: Table
-    row_num: int
+    page_num: int
+    cell_num: int
     end_of_table: bool
 
 class MetaCommandResult(Enum):
@@ -62,23 +87,47 @@ class StatementType(Enum):
     STATEMENT_INSERT = 0
     STATEMENT_SELECT = 1
 
+class NodeType(Enum):
+    NODE_INTERNAL = 0
+    NODE_LEAF = 1
+
 @dataclass
 class Statement:
     statement_type: StatementType = None
     row_to_insert: Row = None
 
+def leaf_node_num_cells(node: bytearray):
+    return node[LEAF_NODE_NUM_CELLS_OFFSET:LEAF_NODE_NUM_CELLS_OFFSET+LEAF_NODE_NUM_CELLS_SIZE]
+
+def leaf_node_cell(node: bytearray, cell_num: int):
+    return node[LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE:LEAF_NODE_HEADER_SIZE + (cell_num + 1) * LEAF_NODE_CELL_SIZE]
+
+def leaf_node_key(node: bytearray, cell_num: int):
+    return leaf_node_cell(node, cell_num)[LEAF_NODE_KEY_OFFSET:LEAF_NODE_KEY_OFFSET+LEAF_NODE_KEY_SIZE]
+
+def leaf_node_value(node: bytearray, cell_num: int):
+    return leaf_node_cell(node, cell_num)[LEAF_NODE_VALUE_OFFSET:LEAF_NODE_VALUE_OFFSET+LEAF_NODE_VALUE_SIZE]
+
+def initialize_leaf_node(node: bytearray):
+    node[LEAF_NODE_NUM_CELLS_OFFSET:LEAF_NODE_NUM_CELLS_OFFSET+LEAF_NODE_NUM_CELLS_SIZE] = (0).to_bytes(LEAF_NODE_NUM_CELLS_SIZE, "little")
+
 def table_start(table: Table):
-    return Cursor(table=table, row_num=0, end_of_table=table.num_rows == 0)
+    root_node = get_page(table.pager, table.root_page_num)
+    num_cells = int.from_bytes(leaf_node_num_cells(root_node), "little")
+    return Cursor(table=table, page_num=table.root_page_num, cell_num=0, end_of_table=num_cells == 0)
 
 def table_end(table: Table):
-    return Cursor(table=table, row_num=table.num_rows, end_of_table=True)   
+    root_node = get_page(table.pager, table.root_page_num)
+    num_cells = int.from_bytes(leaf_node_num_cells(root_node), "little")
+    return Cursor(table=table, page_num=table.root_page_num, cell_num=num_cells, end_of_table=True)
 
 def cursor_advance(cursor: Cursor):
-    cursor.row_num += 1
-    if cursor.row_num >= cursor.table.num_rows:
+    page_num = cursor.page_num
+    node = get_page(cursor.table.pager, page_num)
+    cursor.cell_num += 1
+    if cursor.cell_num >= int.from_bytes(leaf_node_num_cells(node), "little"):
         cursor.end_of_table = True
     return
-
 
 def pager_open(filename: str):
     file_descriptor = os.open(filename, os.O_RDWR | os.O_CREAT, 0o600)
@@ -86,16 +135,11 @@ def pager_open(filename: str):
         print(f"Error: Could not open file \'{filename}\'.")
         sys.exit(1)
     file_length = os.fstat(file_descriptor).st_size
-    pager = Pager(file_descriptor=file_descriptor, file_length=file_length, pages=[None] * TABLE_MAX_PAGES)
+    if file_length % PAGE_SIZE != 0:
+        print(f"Database file is not a whole number of pages. Corrupt file.")
+        sys.exit(1)
+    pager = Pager(num_pages=file_length // PAGE_SIZE, file_descriptor=file_descriptor, file_length=file_length, pages=[None] * TABLE_MAX_PAGES)
     return pager
-
-def db_open(filename: str):
-    pager = pager_open(filename)
-    num_rows = (pager.file_length // PAGE_SIZE) * ROWS_PER_PAGE + (pager.file_length % PAGE_SIZE) // ROW_SIZE
-
-    table = Table(pager=pager, num_rows=num_rows)
-    # print(f"table.num_rows: {table.num_rows}")
-    return table
 
 def get_page(pager: Pager, page_num: int):
     if page_num > TABLE_MAX_PAGES:
@@ -116,12 +160,25 @@ def get_page(pager: Pager, page_num: int):
             if bytes_read == -1:
                 print(f"Error reading file. {os.strerror(os.errno)}")
                 sys.exit(1)
-            pager.pages[page_num] = bytearray(bytes_read)
+            pager.pages[page_num] = bytearray(bytes_read).ljust(PAGE_SIZE, b"\x00")
             # print(f"pager.[page_num] after bytes_read: {pager.pages[page_num]}")
 
-    return pager.pages[page_num]
+        if page_num >= pager.num_pages:
+            pager.num_pages = page_num + 1
 
-def pager_flush(pager: Pager, page_num: int, size: int):
+    return pager.pages[page_num]
+    # return bytearray(PAGE_SIZE)
+
+def db_open(filename: str):
+    pager = pager_open(filename)
+
+    table = Table(pager=pager, root_page_num=0)
+    if pager.num_pages == 0:
+        root_node = get_page(pager, 0)
+        initialize_leaf_node(root_node)
+    return table
+
+def pager_flush(pager: Pager, page_num: int):
     if pager.pages[page_num] is None:
         print(f"Tried to flush null page.")
         sys.exit(1)
@@ -131,7 +188,7 @@ def pager_flush(pager: Pager, page_num: int, size: int):
         print(f"Error seeking. {os.strerror(os.errno)}")
         sys.exit(1)
         
-    result = os.write(pager.file_descriptor, pager.pages[page_num][:size])
+    result = os.write(pager.file_descriptor, pager.pages[page_num][:PAGE_SIZE])
     if result == -1:
         print(f"Error writing. {os.strerror(os.errno)}")
         sys.exit(1)
@@ -140,22 +197,13 @@ def pager_flush(pager: Pager, page_num: int, size: int):
 
 def db_close(table: Table):
     pager = table.pager
-    num_full_pages = table.num_rows // ROWS_PER_PAGE
     # print(f"num_full_pages: {num_full_pages}")
 
-    for i in range(num_full_pages):
+    for i in range(pager.num_pages):
         if pager.pages[i] is None:
             continue
-        pager_flush(pager, i, PAGE_SIZE)
+        pager_flush(pager, i)
         pager.pages[i] = None
-
-    num_additional_rows = table.num_rows % ROWS_PER_PAGE
-    # print(f"num_additional_rows: {num_additional_rows}")
-    if num_additional_rows > 0:
-        page_num = num_full_pages
-        if pager.pages[page_num] is not None:
-            pager_flush(pager, page_num, num_additional_rows * ROW_SIZE)
-            pager.pages[page_num] = None
     
     result = os.close(pager.file_descriptor)
     if result == -1:
@@ -165,32 +213,70 @@ def db_close(table: Table):
     return
 
 
-def serialize_row(source: Row, destination: bytearray, byte_offset: int):
-    base = byte_offset
-    destination[base+ID_OFFSET:base+ID_OFFSET+ID_SIZE] = source.id.to_bytes(ID_SIZE, "little").ljust(ID_SIZE, b"\x00")
-    destination[base+USERNAME_OFFSET:base+USERNAME_OFFSET+USERNAME_SIZE] = source.username.encode("utf-8").ljust(USERNAME_SIZE, b"\x00")
-    destination[base+EMAIL_OFFSET:base+EMAIL_OFFSET+EMAIL_SIZE] = source.email.encode("utf-8").ljust(EMAIL_SIZE, b"\x00")
+def serialize_row(source: Row, destination: bytearray, offset: int):
+    destination[offset+ID_OFFSET:offset+ID_OFFSET+ID_SIZE] = source.id.to_bytes(ID_SIZE, "little").ljust(ID_SIZE, b"\x00")
+    destination[offset+USERNAME_OFFSET:offset+USERNAME_OFFSET+USERNAME_SIZE] = source.username.encode("utf-8").ljust(USERNAME_SIZE, b"\x00")
+    destination[offset+EMAIL_OFFSET:offset+EMAIL_OFFSET+EMAIL_SIZE] = source.email.encode("utf-8").ljust(EMAIL_SIZE, b"\x00")
+    # print("destination after serialize_row: ", destination)
     return
 
-def deserialize_row(source: bytearray, destination: Row, byte_offset: int):
-    base = byte_offset
-    destination.id = int.from_bytes(source[base+ID_OFFSET:base+ID_OFFSET+ID_SIZE].strip(b"\x00"), "little")
-    destination.username = source[base+USERNAME_OFFSET:base+USERNAME_OFFSET+USERNAME_SIZE].strip(b"\x00").decode("utf-8")
-    destination.email = source[base+EMAIL_OFFSET:base+EMAIL_OFFSET+EMAIL_SIZE].strip(b"\x00").decode("utf-8")
+def deserialize_row(source: bytearray, destination: Row):
+    destination.id = int.from_bytes(source[ID_OFFSET:ID_OFFSET+ID_SIZE].strip(b"\x00"), "little")
+    destination.username = source[USERNAME_OFFSET:USERNAME_OFFSET+USERNAME_SIZE].strip(b"\x00").decode("utf-8")
+    destination.email = source[EMAIL_OFFSET:EMAIL_OFFSET+EMAIL_SIZE].strip(b"\x00").decode("utf-8")
     return 
 
 def cursor_value(cursor: Cursor):
-    row_num = cursor.row_num
-    page_num = row_num // ROWS_PER_PAGE
+    page_num = cursor.page_num
     page = get_page(cursor.table.pager, page_num)
-    offset = row_num % ROWS_PER_PAGE
-    byte_offset = offset * ROW_SIZE
-    return page, byte_offset
+    return leaf_node_value(page, cursor.cell_num)
+
+def leaf_node_insert(cursor: Cursor, key: int, value: Row):
+    node = get_page(cursor.table.pager, cursor.page_num)
+    # print("node: ", node)
+
+    num_cells = int.from_bytes(leaf_node_num_cells(node), "little")
+    if num_cells >= LEAF_NODE_MAX_CELLS:
+        print(f"Need to implement splitting a leaf node.")
+        sys.exit(1)
+    
+    # print("cursor before: ", cursor)
+    # print("num_cells: ", num_cells)
+    if cursor.cell_num < num_cells:
+        for i in range(num_cells, cursor.cell_num, -1):
+            node[LEAF_NODE_HEADER_SIZE + i * LEAF_NODE_CELL_SIZE:LEAF_NODE_HEADER_SIZE + (i + 1) * LEAF_NODE_CELL_SIZE] = node[LEAF_NODE_HEADER_SIZE + (i - 1) * LEAF_NODE_CELL_SIZE:LEAF_NODE_HEADER_SIZE + i * LEAF_NODE_CELL_SIZE]
+    node[LEAF_NODE_NUM_CELLS_OFFSET:LEAF_NODE_NUM_CELLS_OFFSET+LEAF_NODE_NUM_CELLS_SIZE] = (int.from_bytes(leaf_node_num_cells(node), "little") + 1).to_bytes(LEAF_NODE_NUM_CELLS_SIZE, "little")
+    node[LEAF_NODE_HEADER_SIZE + LEAF_NODE_KEY_OFFSET:LEAF_NODE_HEADER_SIZE + LEAF_NODE_KEY_OFFSET+LEAF_NODE_KEY_SIZE] = key.to_bytes(LEAF_NODE_KEY_SIZE, "little")
+    serialize_row(value, node, LEAF_NODE_HEADER_SIZE + LEAF_NODE_VALUE_OFFSET + cursor.cell_num * LEAF_NODE_CELL_SIZE)
+    # print("node: ", node)
+    return
+
+def print_constants():
+    print("ROW_SIZE: ", ROW_SIZE)
+    print("COMMON_NODE_HEADER_SIZE: ", COMMON_NODE_HEADER_SIZE)
+    print("LEAF_NODE_HEADER_SIZE: ", LEAF_NODE_HEADER_SIZE)
+    print("LEAF_NODE_CELL_SIZE: ", LEAF_NODE_CELL_SIZE)
+    print("LEAF_NODE_SPACE_FOR_CELLS: ", LEAF_NODE_SPACE_FOR_CELLS)
+    print("LEAF_NODE_MAX_CELLS: ", LEAF_NODE_MAX_CELLS)
+
+def print_leaf_node(node: bytearray):
+    num_cells = int.from_bytes(leaf_node_num_cells(node), "little")
+    print(f"leaf (size {num_cells})")
+    for i in range(num_cells):
+        key = int.from_bytes(leaf_node_key(node, i), "little")
+        print(f"  - {i} : {key}")
+    return
 
 def do_meta_command(meta_command: str, table: Table) -> None:
     if meta_command == ".exit":
         db_close(table)
         sys.exit(0)
+    elif meta_command == ".constants":
+        print_constants()
+        return MetaCommandResult.META_COMMAND_SUCCESS
+    elif meta_command == ".btree":
+        print_leaf_node(get_page(table.pager, table.root_page_num))
+        return MetaCommandResult.META_COMMAND_SUCCESS
     else:
         return MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND
 
@@ -216,21 +302,21 @@ def prepare_statement(command: str, args: list[str], statement: Statement):
     return PrepareResult.PREPARE_UNRECOGNIZED_STATEMENT
 
 def execute_insert(statement: Statement, table: Table):
-    if table.num_rows >= TABLE_MAX_ROWS:
+    
+    node = get_page(table.pager, table.root_page_num)
+    if int.from_bytes(leaf_node_num_cells(node), "little") >= LEAF_NODE_MAX_CELLS:
         return ExecuteResult.EXECUTE_TABLE_FULL
     row_to_insert = statement.row_to_insert
     cursor = table_end(table)
-    page, byte_offset = cursor_value(cursor)
-    serialize_row(row_to_insert, page, byte_offset)
-    table.num_rows += 1
+    # print("cursor: ", cursor)
+    leaf_node_insert(cursor, row_to_insert.id, row_to_insert)
     return ExecuteResult.EXECUTE_SUCCESS
 
 def execute_select(statement: Statement, table: Table):
     cursor = table_start(table)
     while not cursor.end_of_table:
         row = Row(id=0, username="", email="")
-        page, byte_offset = cursor_value(cursor)
-        deserialize_row(page, row, byte_offset)
+        deserialize_row(cursor_value(cursor), row)
         print(f"({row.id}, {row.username}, {row.email})")
         cursor_advance(cursor)
     return ExecuteResult.EXECUTE_SUCCESS
