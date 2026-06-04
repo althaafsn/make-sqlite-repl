@@ -54,10 +54,10 @@ class TestDB:
     def test_insert_and_select_overflow(self):
         input = []
 
-        for i in range(db.TABLE_MAX_ROWS + 1):
+        for i in range(1400):
             input.append(f"insert {i} user{i} person{i}@example.com")
-        input.append(f"insert {db.TABLE_MAX_ROWS + 1} user{db.TABLE_MAX_ROWS + 1} person{db.TABLE_MAX_ROWS + 1}@example.com")
-        input.append("select")
+        input.append(f"insert {1400} user{1400} person{1400}@example.com")
+        input.append(".btree")
         input.append(".exit")
         result = self.run_script(input)
         print(result)
@@ -144,3 +144,14 @@ class TestDB:
         result = self.run_script(input)
         print(result)
         # os.remove("test.db")
+
+    def test_internal_node_find(self):
+        os.remove("db.db")
+        input = []
+        for i in range(20):
+            input.append(f"insert {i} user{i} person{i}@example.com")
+        input.append(".btree")
+        input.append(".exit")
+        result = self.run_script(input)
+        print(result)
+        os.remove("db.db")

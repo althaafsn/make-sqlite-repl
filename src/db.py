@@ -198,6 +198,31 @@ def leaf_node_find(table: Table, page_num: int, key: int):
     # print(f"Key {key} not found, should be inserted at index {min_index}.")
     return Cursor(table=table, page_num=page_num, cell_num=min_index, end_of_table=min_index + 1 == num_cells)
 
+def internal_node_find(table: Table, page_num: int, key: int):
+    node = get_page(table.pager, page_num)
+    num_keys = int.from_bytes(internal_node_num_keys(node), "little")
+
+    # Binary search to find index of child to search
+    min_index = 0
+    max_index = num_keys
+    
+    while max_index > min_index:
+        index = (min_index + max_index) // 2
+        key_to_right = int.from_bytes(internal_node_key(node, index), "little")
+        if key_to_right >= key:
+            max_index = index
+        else:
+            min_index = index + 1
+    
+    child_num = internal_node_child(node, min_index)
+    child = get_page(table.pager, int.from_bytes(child_num, "little"))
+    match int.from_bytes(get_node_type(child), "little"):
+        case NodeType.NODE_INTERNAL.value:
+            return internal_node_find(table, int.from_bytes(child_num, "little"), key)
+        case NodeType.NODE_LEAF.value:
+            return leaf_node_find(table, int.from_bytes(child_num, "little"), key)
+
+
 def table_start(table: Table):
     root_node = get_page(table.pager, table.root_page_num)
     num_cells = int.from_bytes(leaf_node_num_cells(root_node), "little")
@@ -212,8 +237,7 @@ def table_find(table: Table, key: int):
     if int.from_bytes(get_node_type(root_node), "little") == NodeType.NODE_LEAF.value:
         return leaf_node_find(table, root_page_num, key)
     else:
-        print(f"Need to implement searching an internal node.")
-        sys.exit(1)
+        return internal_node_find(table, root_page_num, key)
 
 def cursor_advance(cursor: Cursor):
     page_num = cursor.page_num
