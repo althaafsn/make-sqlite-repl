@@ -133,3 +133,14 @@ class TestDB:
         result = self.run_script(input)
         print(result)
         os.remove("test.db")
+
+    def test_three_leaf_nodes(self):
+        # os.remove("db.db")
+        input = []
+        for i in range(13):
+            input.append(f"insert {i} user{i} person{i}@example.com")
+        input.append(".btree")
+        input.append(".exit")
+        result = self.run_script(input)
+        print(result)
+        # os.remove("test.db")
