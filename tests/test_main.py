@@ -154,4 +154,4 @@ class TestDB:
         input.append(".exit")
         result = self.run_script(input)
         print(result)
-        os.remove("db.db")
+        # os.remove("db.db")
