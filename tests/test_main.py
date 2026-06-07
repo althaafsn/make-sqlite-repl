@@ -65,7 +65,7 @@ class TestDB:
 
     def test_insert_overflow_username(self):
         input = []
-        input.append(f"insert 1 {"a" * (db.USERNAME_SIZE + 1)} person1@example.com")
+        input.append(f"insert 1 {"a" * (db.COLUMN_USERNAME_SIZE + 1)} person1@example.com")
         input.append("select")
         input.append(".exit")
         result = self.run_script(input)
@@ -74,7 +74,7 @@ class TestDB:
 
     def test_insert_overflow_email(self):
         input = []
-        input.append(f"insert 1 user1 {"a" * (db.EMAIL_SIZE + 1)}")
+        input.append(f"insert 1 user1 {"a" * (db.COLUMN_EMAIL_SIZE + 1)}")
         input.append("select")
         input.append(".exit")
         result = self.run_script(input)
@@ -148,9 +148,9 @@ class TestDB:
     def test_internal_node_find(self):
         os.remove("db.db")
         input = []
-        for i in range(20):
+        for i in range(30):
             input.append(f"insert {i} user{i} person{i}@example.com")
-        input.append(".btree")
+        # input.append(".btree")
         input.append(".exit")
         result = self.run_script(input)
         print(result)

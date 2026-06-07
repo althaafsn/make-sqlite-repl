@@ -45,31 +45,31 @@ class TestDB:
 
     def test_insert_max_length_id(self):
         table = main.Table()
-        insert = main.Statement(statement_type=main.StatementType.STATEMENT_INSERT, row_to_insert=main.Row(id=2**main.ID_SIZE - 1, username="John Doe", email="john.doe@example.com"))
+        insert = main.Statement(statement_type=main.StatementType.STATEMENT_INSERT, row_to_insert=main.Row(id=2**(8 * main.ID_SIZE) - 1, username="John Doe", email="john.doe@example.com"))
         main.execute_statement(insert, table)
         assert table.num_rows == 1
         row = main.Row(id=0, username="", email="")
         page, byte_offset = main.row_slot(table, 0)
         main.deserialize_row(page, row, byte_offset)
-        assert row.id == 2**main.ID_SIZE - 1
+        assert row.id == 2**(8 * main.ID_SIZE) - 1
         assert row.username.strip("\x00") == "John Doe"
         assert row.email.strip("\x00") == "john.doe@example.com"
 
     def test_insert_max_length_username(self):
         table = main.Table()
-        insert = main.Statement(statement_type=main.StatementType.STATEMENT_INSERT, row_to_insert=main.Row(id=1, username="a" * main.USERNAME_SIZE, email="john.doe@example.com"))
+        insert = main.Statement(statement_type=main.StatementType.STATEMENT_INSERT, row_to_insert=main.Row(id=1, username="a" * main.COLUMN_USERNAME_SIZE, email="john.doe@example.com"))
         main.execute_statement(insert, table)
         assert table.num_rows == 1
         row = main.Row(id=0, username="", email="")
         page, byte_offset = main.row_slot(table, 0)
         main.deserialize_row(page, row, byte_offset)
         assert row.id == 1
-        assert row.username.strip("\x00") == "a" * main.USERNAME_SIZE
+        assert row.username.strip("\x00") == "a" * main.COLUMN_USERNAME_SIZE
         assert row.email.strip("\x00") == "john.doe@example.com"
 
     def test_insert_max_length_email(self):
         table = main.Table()
-        insert = main.Statement(statement_type=main.StatementType.STATEMENT_INSERT, row_to_insert=main.Row(id=1, username="a", email="a" * main.EMAIL_SIZE))
+        insert = main.Statement(statement_type=main.StatementType.STATEMENT_INSERT, row_to_insert=main.Row(id=1, username="a", email="a" * main.COLUMN_EMAIL_SIZE))
         main.execute_statement(insert, table)
         assert table.num_rows == 1
         row = main.Row(id=0, username="", email="")
@@ -77,12 +77,12 @@ class TestDB:
         main.deserialize_row(page, row, byte_offset)
         assert row.id == 1
         assert row.username.strip("\x00") == "a"
-        assert row.email.strip("\x00") == "a" * main.EMAIL_SIZE
+        assert row.email.strip("\x00") == "a" * main.COLUMN_EMAIL_SIZE
 
     def test_insert_overflow_username(self):
         table = main.Table()
         command = "insert"
-        args = ["1", "a" * (main.USERNAME_SIZE + 1), "a"]
+        args = ["1", "a" * (main.COLUMN_USERNAME_SIZE + 1), "a"]
         insert = main.Statement()
         result = main.prepare_statement(command, args, insert)
         assert result == main.PrepareResult.PREPARE_STRING_TOO_LONG
@@ -91,7 +91,7 @@ class TestDB:
     def test_insert_overflow_email(self):
         table = main.Table()
         command = "insert"
-        args = ["1", "a", "a" * (main.EMAIL_SIZE + 1)]
+        args = ["1", "a", "a" * (main.COLUMN_EMAIL_SIZE + 1)]
         insert = main.Statement()
         result = main.prepare_statement(command, args, insert)
         assert result == main.PrepareResult.PREPARE_STRING_TOO_LONG
