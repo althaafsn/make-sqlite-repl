@@ -1,0 +1,20 @@
+# Dependencies & build output (also listed in root .gitignore)
+node_modules/
+dist/
+dist-ssr/
+*.tsbuildinfo
+
+# Local env
+.env
+.env.*
+*.local
+
+# Logs
+logs/
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

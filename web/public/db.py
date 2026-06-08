@@ -1,8 +1,14 @@
-from hmac import new
-import sys
+import json
 import os
-from enum import Enum
+from collections import defaultdict
+from contextlib import redirect_stdout
 from dataclasses import dataclass
+from enum import Enum
+from io import StringIO
+
+
+class DbFatalError(Exception):
+    """Raised instead of sys.exit so the browser tab never freezes."""
 
 # =============================================================================
 # Row schema
@@ -121,6 +127,7 @@ class Cursor:
 class MetaCommandResult(Enum):
     META_COMMAND_SUCCESS = 0
     META_COMMAND_UNRECOGNIZED_COMMAND = 1
+    META_COMMAND_EXIT = 2
 
 class PrepareResult(Enum):
     PREPARE_SUCCESS = 0
@@ -155,12 +162,10 @@ class Statement:
 def pager_open(filename: str):
     file_descriptor = os.open(filename, os.O_RDWR | os.O_CREAT, 0o600)
     if file_descriptor == -1:
-        print(f"Error: Could not open file \'{filename}\'.")
-        sys.exit(1)
+        raise DbFatalError(f"Could not open file '{filename}'.")
     file_length = os.fstat(file_descriptor).st_size
     if file_length % PAGE_SIZE != 0:
-        print(f"Database file is not a whole number of pages. Corrupt file.")
-        sys.exit(1)
+        raise DbFatalError("Database file is not a whole number of pages. Corrupt file.")
     pager = Pager(num_pages=file_length // PAGE_SIZE, file_descriptor=file_descriptor, file_length=file_length, pages=[None] * TABLE_MAX_PAGES)
     return pager
 
@@ -169,8 +174,7 @@ def get_page(pager: Pager, page_num: int):
         # print("Pager:", pager)
         # print("page_num: ", int.to_bytes(page_num, 8, "little"))
         # print("Page num:", int.from_bytes(int.to_bytes(page_num, 4, "little"), "little"))
-        print(f"Tried to fetch page number out of bounds. {page_num} > {TABLE_MAX_PAGES}")
-        sys.exit(1)
+        raise DbFatalError(f"Tried to fetch page number out of bounds. {page_num} > {TABLE_MAX_PAGES}")
 
     if pager.pages[page_num] is None:
         pager.pages[page_num] = bytearray(PAGE_SIZE)
@@ -184,8 +188,7 @@ def get_page(pager: Pager, page_num: int):
             
             bytes_read = os.read(pager.file_descriptor, PAGE_SIZE)
             if bytes_read == -1:
-                print(f"Error reading file. {os.strerror(os.errno)}")
-                sys.exit(1)
+                raise DbFatalError(f"Error reading file. {os.strerror(os.errno)}")
             pager.pages[page_num] = bytearray(bytes_read).ljust(PAGE_SIZE, b"\x00")
             # print(f"pager.[page_num] after bytes_read: {pager.pages[page_num]}")
 
@@ -197,18 +200,15 @@ def get_page(pager: Pager, page_num: int):
 
 def pager_flush(pager: Pager, page_num: int):
     if pager.pages[page_num] is None:
-        print(f"Tried to flush null page.")
-        sys.exit(1)
-    
+        raise DbFatalError("Tried to flush null page.")
+
     offset = os.lseek(pager.file_descriptor, page_num * PAGE_SIZE, os.SEEK_SET)
     if offset == -1:
-        print(f"Error seeking. {os.strerror(os.errno)}")
-        sys.exit(1)
-        
+        raise DbFatalError(f"Error seeking. {os.strerror(os.errno)}")
+
     result = os.write(pager.file_descriptor, pager.pages[page_num][:PAGE_SIZE])
     if result == -1:
-        print(f"Error writing. {os.strerror(os.errno)}")
-        sys.exit(1)
+        raise DbFatalError(f"Error writing. {os.strerror(os.errno)}")
     return
 
 def get_unused_page_num(pager: Pager):
@@ -273,8 +273,7 @@ def internal_node_child(node: bytearray, child_num: int):
     num_keys = int.from_bytes(internal_node_num_keys(node), "little")
     # print(f"num_keys: {num_keys}")
     if child_num > num_keys:
-        print(f"Tried to access child_num {child_num} in internal node with {num_keys} keys.")
-        sys.exit(1)
+        raise DbFatalError(f"Tried to access child_num {child_num} in internal node with {num_keys} keys.")
     elif child_num == num_keys:
         return internal_node_right_child(node)
     else:
@@ -690,14 +689,31 @@ def db_close(table: Table):
     
     result = os.close(pager.file_descriptor)
     if result == -1:
-        print(f"Error closing file. {os.strerror(os.errno)}")
-        sys.exit(1)
+        raise DbFatalError(f"Error closing file. {os.strerror(os.errno)}")
     
     return
 
 # =============================================================================
 # REPL
 # =============================================================================
+
+def print_help():
+    print("B-Tree Database — command reference")
+    print("─────────────────────────────────")
+    print("  insert <id> <username> <email>   Add a row (id is the B-Tree key)")
+    print("  select                           Print all rows in key order")
+    print("")
+    print("  .btree                           Print tree + refresh visualizer")
+    print("  .constants                       Show page layout constants")
+    print("  .help                            Show this guide")
+    print("  .exit                            Close the database")
+    print("")
+    print("Tips:")
+    print("  • Click a node in the visualizer to inspect its memory map")
+    print("  • Each leaf page holds up to 3 keys — more inserts cause splits")
+    print("  • Use Import / Export .db in the header to save your work")
+    print("")
+    print("Example:  insert 1 alice alice@example.com")
 
 def print_constants():
     print("ROW_SIZE: ", ROW_SIZE)
@@ -776,12 +792,16 @@ def print_pager(pager: Pager):
     return
 
 
-def do_meta_command(meta_command: str, table: Table) -> None:
+def do_meta_command(meta_command: str, table: Table):
     if meta_command == ".exit":
         db_close(table)
-        sys.exit(0)
+        print("Goodbye.")
+        return MetaCommandResult.META_COMMAND_EXIT
     elif meta_command == ".constants":
         print_constants()
+        return MetaCommandResult.META_COMMAND_SUCCESS
+    elif meta_command == ".help":
+        print_help()
         return MetaCommandResult.META_COMMAND_SUCCESS
     elif meta_command == ".btree":
         print("Tree:")
@@ -841,56 +861,542 @@ def execute_statement(statement: Statement, table: Table):
         case StatementType.STATEMENT_SELECT:
             return execute_select(statement, table)
 
-def print_prompt():
-    print("db > ", end="")
+# =============================================================================
+# Browser / Pyodide API
+# =============================================================================
 
-def main(args: list[str]):
-    # if len(args) == 0:
-    #     print("Must supply a database filename.")
-    #     sys.exit(1)
-    # filename = args[0]
-    filename = "db.db"
-    table = db_open(filename)
+_table: Table | None = None
+_database_path = "/db.db"
+H_SPACING = 280
+V_SPACING = 180
 
-    while True:
-        print_prompt()
-        arg = input()
 
-        command = arg.split(" ")[0]
-        args = arg.split(" ")[1:]
+def init_database(path: str = "/db.db") -> str:
+    """Open or create the database at the given Pyodide virtual-FS path."""
+    global _table, _database_path
+    _database_path = path
+    _table = db_open(path)
+    return ""
 
-        if command[0] == ".":
-            match do_meta_command(command, table):
-                case MetaCommandResult.META_COMMAND_SUCCESS:
-                    continue
-                case MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND:
-                    print(f"Unrecognized command \'{command}\'.")
-                    continue
 
-        statement = Statement()
-        match prepare_statement(command, args, statement):
-            case PrepareResult.PREPARE_SUCCESS:
-                None
-            case PrepareResult.PREPARE_SYNTAX_ERROR:
-                print(f"Syntax error. Could not parse statement.")
-                continue
-            case PrepareResult.PREPARE_UNRECOGNIZED_STATEMENT:
-                print(f"Unrecognized keyword at start of \'{command} {str.join(" ", args)}\'.")
-                continue
-            case PrepareResult.PREPARE_STRING_TOO_LONG:
-                print(f"String is too long.")
-                continue
-            case PrepareResult.PREPARE_NEGATIVE_ID:
-                print(f"ID must be positive.")
-                continue
-        
-        match execute_statement(statement, table):
-            case ExecuteResult.EXECUTE_SUCCESS:
-                print("Executed.")
-            case ExecuteResult.EXECUTE_TABLE_FULL:
-                print("Error: Table full.")
-            case ExecuteResult.EXECUTE_DUPLICATE_KEY:
-                print("Error: Duplicate key.")
-        
-if __name__ == "__main__":
-    main(sys.argv[1:])
+def flush_database() -> str:
+    """Persist dirty pages without closing the file descriptor."""
+    if _table is None:
+        return ""
+    pager = _table.pager
+    for i in range(pager.num_pages):
+        if pager.pages[i] is not None:
+            pager_flush(pager, i)
+    return ""
+
+
+def _run_command(table: Table, arg: str) -> MetaCommandResult | None:
+    command = arg.split(" ")[0]
+    args = arg.split(" ")[1:]
+
+    if command.startswith("."):
+        match do_meta_command(command, table):
+            case MetaCommandResult.META_COMMAND_SUCCESS:
+                return None
+            case MetaCommandResult.META_COMMAND_EXIT:
+                return MetaCommandResult.META_COMMAND_EXIT
+            case MetaCommandResult.META_COMMAND_UNRECOGNIZED_COMMAND:
+                print(f"Unrecognized command '{command}'.")
+                return None
+
+    statement = Statement()
+    match prepare_statement(command, args, statement):
+        case PrepareResult.PREPARE_SUCCESS:
+            pass
+        case PrepareResult.PREPARE_SYNTAX_ERROR:
+            print("Syntax error. Could not parse statement.")
+            return None
+        case PrepareResult.PREPARE_UNRECOGNIZED_STATEMENT:
+            print(f"Unrecognized keyword at start of '{command} {' '.join(args)}'.")
+            return None
+        case PrepareResult.PREPARE_STRING_TOO_LONG:
+            print("String is too long.")
+            return None
+        case PrepareResult.PREPARE_NEGATIVE_ID:
+            print("ID must be positive.")
+            return None
+
+    match execute_statement(statement, table):
+        case ExecuteResult.EXECUTE_SUCCESS:
+            print("Executed.")
+        case ExecuteResult.EXECUTE_TABLE_FULL:
+            print("Error: Table full.")
+        case ExecuteResult.EXECUTE_DUPLICATE_KEY:
+            print("Error: Duplicate key.")
+    return None
+
+
+def execute_command(cmd: str) -> str:
+    """Parse and run one SQL or meta-command; return captured stdout as a string."""
+    global _table
+    buffer = StringIO()
+    try:
+        with redirect_stdout(buffer):
+            if _table is None:
+                print("Database not open. Call init_database() first.")
+                return buffer.getvalue()
+
+            arg = cmd.strip()
+            if not arg:
+                return ""
+
+            result = _run_command(_table, arg)
+            if result == MetaCommandResult.META_COMMAND_EXIT:
+                _table = None
+    except DbFatalError as exc:
+        buffer.write(str(exc))
+        if not str(exc).endswith("\n"):
+            buffer.write("\n")
+    return buffer.getvalue()
+
+
+def _child_page_num(node: bytearray, child_num: int) -> int:
+    child = internal_node_child(node, child_num)
+    return int.from_bytes(
+        child[INTERNAL_NODE_CHILD_OFFSET:INTERNAL_NODE_CHILD_OFFSET + INTERNAL_NODE_CHILD_SIZE],
+        "little",
+    )
+
+
+def _collect_tree_nodes(pager: Pager, page_num: int, depth: int, nodes: list, edges: list) -> None:
+    node_id = f"page-{page_num}"
+    node = get_page(pager, page_num)
+    node_type = int.from_bytes(get_node_type(node), "little")
+
+    if node_type == NodeType.NODE_LEAF.value:
+        num_keys = int.from_bytes(leaf_node_num_cells(node), "little")
+        keys = [int.from_bytes(leaf_node_key(node, i), "little") for i in range(num_keys)]
+        key_text = ", ".join(str(key) for key in keys) if keys else "(empty)"
+        nodes.append({
+            "id": node_id,
+            "type": "customNode",
+            "data": {
+                "label": f"Leaf p{page_num} (size {num_keys})\n{key_text}",
+                "page": page_num,
+                "depth": depth,
+                "nodeKind": "leaf",
+                "keys": keys,
+            },
+            "position": {"x": 0, "y": 0},
+        })
+        return
+
+    num_keys = int.from_bytes(internal_node_num_keys(node), "little")
+    keys = [int.from_bytes(internal_node_key(node, i), "little") for i in range(num_keys)]
+    key_text = ", ".join(f"key {key}" for key in keys) if keys else "(no keys)"
+    nodes.append({
+        "id": node_id,
+        "type": "customNode",
+        "data": {
+            "label": f"Internal p{page_num} (size {num_keys})\n{key_text}",
+            "page": page_num,
+            "depth": depth,
+            "nodeKind": "internal",
+            "keys": keys,
+        },
+        "position": {"x": 0, "y": 0},
+    })
+
+    for child_index in range(num_keys + 1):
+        child_page = _child_page_num(node, child_index)
+        if child_page == INVALID_PAGE_NUM:
+            continue
+        child_id = f"page-{child_page}"
+        edges.append({
+            "id": f"e-{node_id}-{child_id}-{child_index}",
+            "source": node_id,
+            "target": child_id,
+        })
+        _collect_tree_nodes(pager, child_page, depth + 1, nodes, edges)
+
+
+def _layout_tree_nodes(nodes: list) -> None:
+    levels: dict[int, list] = defaultdict(list)
+    for node in nodes:
+        levels[node["data"]["depth"]].append(node)
+
+    for depth, level_nodes in sorted(levels.items()):
+        level_nodes.sort(key=lambda node: node["data"]["page"])
+        count = len(level_nodes)
+        for index, node in enumerate(level_nodes):
+            node["position"] = {
+                "x": (index - (count - 1) / 2) * H_SPACING + 400,
+                "y": depth * V_SPACING + 50,
+            }
+
+
+def get_tree_json() -> str:
+    """Return a React Flow graph as a JSON string with nodes and edges arrays."""
+    if _table is None:
+        return json.dumps({"nodes": [], "edges": []})
+
+    nodes: list = []
+    edges: list = []
+    _collect_tree_nodes(_table.pager, _table.root_page_num, 0, nodes, edges)
+    _layout_tree_nodes(nodes)
+
+    for node in nodes:
+        node["data"].pop("depth", None)
+
+    return json.dumps({"nodes": nodes, "edges": edges})
+
+
+def _memory_field(name: str, label: str, description: str, offset: int, size: int, raw: bytearray, value: str) -> dict:
+    return {
+        "name": name,
+        "label": label,
+        "description": description,
+        "offset": offset,
+        "size": size,
+        "rawHex": raw.hex(),
+        "value": value,
+    }
+
+
+def _format_page_num(page_num: int) -> str:
+    if page_num == INVALID_PAGE_NUM:
+        return f"{page_num} (INVALID — no page)"
+    return str(page_num)
+
+
+def _byte_range(start: int, size: int) -> str:
+    end = start + size - 1
+    if start == end:
+        return f"byte {start}"
+    return f"bytes {start}-{end}"
+
+
+def _memory_block(start: int, size: int, label: str, kind: str, cell_index=None, value: str = "", used: bool = True) -> dict:
+    end = start + size - 1
+    return {
+        "start": start,
+        "end": end,
+        "size": size,
+        "byteRange": _byte_range(start, size),
+        "label": label,
+        "kind": kind,
+        "cellIndex": cell_index,
+        "value": value,
+        "used": used,
+    }
+
+
+def _build_leaf_memory_layout(node: bytearray, num_cells: int) -> list:
+    rows: list = []
+
+    header_blocks = [
+        _memory_block(NODE_TYPE_OFFSET, NODE_TYPE_SIZE, "node_type", "header", value="leaf"),
+        _memory_block(IS_ROOT_OFFSET, IS_ROOT_SIZE, "is_root", "header", value="true" if is_node_root(node) else "false"),
+        _memory_block(PARENT_POINTER_OFFSET, PARENT_POINTER_SIZE, "parent_pointer", "header", value=_format_page_num(int.from_bytes(node_parent(node), "little"))),
+        _memory_block(LEAF_NODE_NUM_CELLS_OFFSET, LEAF_NODE_NUM_CELLS_SIZE, "num_cells", "header", value=str(num_cells)),
+        _memory_block(LEAF_NODE_NEXT_LEAF_OFFSET, LEAF_NODE_NEXT_LEAF_SIZE, "next_leaf", "header", value=_format_page_num(int.from_bytes(leaf_node_next_leaf(node), "little"))),
+    ]
+    rows.append({"type": "header", "blocks": header_blocks})
+
+    visible_cells: list = list(range(LEAF_NODE_MAX_CELLS))
+    if LEAF_NODE_MAX_CELLS > 5:
+        visible_cells = [0, 1, 2, "ellipsis", LEAF_NODE_MAX_CELLS - 1]
+
+    for item in visible_cells:
+        if item == "ellipsis":
+            skip_start = LEAF_NODE_HEADER_SIZE + 3 * LEAF_NODE_CELL_SIZE
+            skip_end = LEAF_NODE_HEADER_SIZE + (LEAF_NODE_MAX_CELLS - 1) * LEAF_NODE_CELL_SIZE - 1
+            rows.append({
+                "type": "ellipsis",
+                "start": skip_start,
+                "end": skip_end,
+                "byteRange": _byte_range(skip_start, skip_end - skip_start + 1),
+                "label": f"cells 3–{LEAF_NODE_MAX_CELLS - 2}",
+            })
+            continue
+
+        cell_index = item
+        cell_offset = LEAF_NODE_HEADER_SIZE + cell_index * LEAF_NODE_CELL_SIZE
+        used = cell_index < num_cells
+        if used:
+            key = int.from_bytes(leaf_node_key(node, cell_index), "little")
+            value_bytes = leaf_node_value(node, cell_index)
+            row = Row()
+            deserialize_row(value_bytes, row)
+            key_value = str(key)
+            value_summary = f"id={row.id}, user={row.username or '(empty)'}"
+        else:
+            key_value = ""
+            value_summary = "(unused slot)"
+
+        rows.append({
+            "type": "cell",
+            "cellIndex": cell_index,
+            "blocks": [
+                _memory_block(cell_offset + LEAF_NODE_KEY_OFFSET, LEAF_NODE_KEY_SIZE, f"key {cell_index}", "key", cell_index, key_value, used),
+                _memory_block(cell_offset + LEAF_NODE_VALUE_OFFSET, LEAF_NODE_VALUE_SIZE, f"value {cell_index}", "value", cell_index, value_summary, used),
+            ],
+        })
+
+    waste_start = LEAF_NODE_HEADER_SIZE + LEAF_NODE_MAX_CELLS * LEAF_NODE_CELL_SIZE
+    if waste_start < PAGE_SIZE:
+        rows.append({
+            "type": "waste",
+            "blocks": [_memory_block(waste_start, PAGE_SIZE - waste_start, "wasted space", "waste")],
+        })
+
+    return rows
+
+
+def _build_internal_memory_layout(node: bytearray, num_keys: int) -> list:
+    rows: list = []
+    right_child = int.from_bytes(internal_node_right_child(node), "little")
+
+    header_blocks = [
+        _memory_block(NODE_TYPE_OFFSET, NODE_TYPE_SIZE, "node_type", "header", value="internal"),
+        _memory_block(IS_ROOT_OFFSET, IS_ROOT_SIZE, "is_root", "header", value="true" if is_node_root(node) else "false"),
+        _memory_block(PARENT_POINTER_OFFSET, PARENT_POINTER_SIZE, "parent_pointer", "header", value=_format_page_num(int.from_bytes(node_parent(node), "little"))),
+        _memory_block(INTERNAL_NODE_NUM_KEYS_OFFSET, INTERNAL_NODE_NUM_KEYS_SIZE, "num_keys", "header", value=str(num_keys)),
+        _memory_block(INTERNAL_NODE_RIGHT_CHILD_OFFSET, INTERNAL_NODE_RIGHT_CHILD_SIZE, "right_child", "header", value=_format_page_num(right_child)),
+    ]
+    rows.append({"type": "header", "blocks": header_blocks})
+
+    for cell_index in range(INTERNAL_NODE_MAX_CELLS):
+        cell_offset = INTERNAL_NODE_HEADER_SIZE + cell_index * INTERNAL_NODE_CELL_SIZE
+        used = cell_index < num_keys
+        if used:
+            child_page = int.from_bytes(
+                internal_node_child(node, cell_index)[INTERNAL_NODE_CHILD_OFFSET:INTERNAL_NODE_CHILD_OFFSET + INTERNAL_NODE_CHILD_SIZE],
+                "little",
+            )
+            separator_key = int.from_bytes(internal_node_key(node, cell_index), "little")
+            child_value = _format_page_num(child_page)
+            key_value = str(separator_key)
+        else:
+            child_value = ""
+            key_value = ""
+
+        rows.append({
+            "type": "cell",
+            "cellIndex": cell_index,
+            "blocks": [
+                _memory_block(cell_offset + INTERNAL_NODE_CHILD_OFFSET, INTERNAL_NODE_CHILD_SIZE, f"child {cell_index}", "child", cell_index, child_value, used),
+                _memory_block(cell_offset + INTERNAL_NODE_KEY_OFFSET, INTERNAL_NODE_KEY_SIZE, f"key {cell_index}", "key", cell_index, key_value, used),
+            ],
+        })
+
+    waste_start = INTERNAL_NODE_HEADER_SIZE + INTERNAL_NODE_MAX_CELLS * INTERNAL_NODE_CELL_SIZE
+    if waste_start < PAGE_SIZE:
+        rows.append({
+            "type": "waste",
+            "blocks": [_memory_block(waste_start, PAGE_SIZE - waste_start, "wasted space", "waste")],
+        })
+
+    return rows
+
+
+def get_page_memory_json(page_num: int) -> str:
+    """Return labeled memory layout for a single B-Tree page."""
+    if _table is None:
+        return json.dumps({"error": "Database not open."})
+
+    node = get_page(_table.pager, page_num)
+    node_type_val = int.from_bytes(get_node_type(node), "little")
+    node_kind = "leaf" if node_type_val == NodeType.NODE_LEAF.value else "internal"
+
+    sections: list = []
+
+    common_fields = [
+        _memory_field(
+            "node_type",
+            "Node Type",
+            "0 = NODE_INTERNAL, 1 = NODE_LEAF",
+            NODE_TYPE_OFFSET,
+            NODE_TYPE_SIZE,
+            get_node_type(node),
+            "NODE_LEAF (1)" if node_kind == "leaf" else "NODE_INTERNAL (0)",
+        ),
+        _memory_field(
+            "is_root",
+            "Is Root",
+            "1 if this page is the B-Tree root",
+            IS_ROOT_OFFSET,
+            IS_ROOT_SIZE,
+            node[IS_ROOT_OFFSET:IS_ROOT_OFFSET + IS_ROOT_SIZE],
+            "true" if is_node_root(node) else "false",
+        ),
+        _memory_field(
+            "parent_pointer",
+            "Parent Page",
+            "Page number of the parent internal node",
+            PARENT_POINTER_OFFSET,
+            PARENT_POINTER_SIZE,
+            node_parent(node),
+            _format_page_num(int.from_bytes(node_parent(node), "little")),
+        ),
+    ]
+    sections.append({
+        "title": "Common Node Header",
+        "offset": 0,
+        "size": COMMON_NODE_HEADER_SIZE,
+        "fields": common_fields,
+    })
+
+    if node_kind == "leaf":
+        num_cells = int.from_bytes(leaf_node_num_cells(node), "little")
+        next_leaf = int.from_bytes(leaf_node_next_leaf(node), "little")
+        leaf_header_fields = [
+            _memory_field(
+                "num_cells",
+                "Num Cells",
+                f"Number of key/value pairs stored (max {LEAF_NODE_MAX_CELLS})",
+                LEAF_NODE_NUM_CELLS_OFFSET,
+                LEAF_NODE_NUM_CELLS_SIZE,
+                leaf_node_num_cells(node),
+                str(num_cells),
+            ),
+            _memory_field(
+                "next_leaf",
+                "Next Leaf Page",
+                "Linked-list pointer to the next leaf page (0 = end of table)",
+                LEAF_NODE_NEXT_LEAF_OFFSET,
+                LEAF_NODE_NEXT_LEAF_SIZE,
+                leaf_node_next_leaf(node),
+                _format_page_num(next_leaf) if next_leaf != 0 else "0 (end of table)",
+            ),
+        ]
+        sections.append({
+            "title": "Leaf Node Header",
+            "offset": COMMON_NODE_HEADER_SIZE,
+            "size": LEAF_NODE_HEADER_SIZE - COMMON_NODE_HEADER_SIZE,
+            "fields": leaf_header_fields,
+        })
+
+        for cell_index in range(num_cells):
+            cell_offset = LEAF_NODE_HEADER_SIZE + cell_index * LEAF_NODE_CELL_SIZE
+            key = int.from_bytes(leaf_node_key(node, cell_index), "little")
+            value_bytes = leaf_node_value(node, cell_index)
+            row = Row()
+            deserialize_row(value_bytes, row)
+            cell_fields = [
+                _memory_field(
+                    f"cell_{cell_index}_key",
+                    "Key (ID)",
+                    "B-Tree search key for this cell",
+                    cell_offset + LEAF_NODE_KEY_OFFSET,
+                    LEAF_NODE_KEY_SIZE,
+                    leaf_node_key(node, cell_index),
+                    str(key),
+                ),
+                _memory_field(
+                    f"cell_{cell_index}_row_id",
+                    "Row ID",
+                    "User row primary key stored in the cell value",
+                    cell_offset + LEAF_NODE_VALUE_OFFSET + ID_OFFSET,
+                    ID_SIZE,
+                    value_bytes[ID_OFFSET:ID_OFFSET + ID_SIZE],
+                    str(row.id),
+                ),
+                _memory_field(
+                    f"cell_{cell_index}_username",
+                    "Username",
+                    "Fixed-width username string",
+                    cell_offset + LEAF_NODE_VALUE_OFFSET + USERNAME_OFFSET,
+                    USERNAME_SIZE,
+                    value_bytes[USERNAME_OFFSET:USERNAME_OFFSET + USERNAME_SIZE],
+                    row.username or "(empty)",
+                ),
+                _memory_field(
+                    f"cell_{cell_index}_email",
+                    "Email",
+                    "Fixed-width email string",
+                    cell_offset + LEAF_NODE_VALUE_OFFSET + EMAIL_OFFSET,
+                    EMAIL_SIZE,
+                    value_bytes[EMAIL_OFFSET:EMAIL_OFFSET + EMAIL_SIZE],
+                    row.email or "(empty)",
+                ),
+            ]
+            sections.append({
+                "title": f"Leaf Cell {cell_index}",
+                "offset": cell_offset,
+                "size": LEAF_NODE_CELL_SIZE,
+                "fields": cell_fields,
+            })
+    else:
+        num_keys = int.from_bytes(internal_node_num_keys(node), "little")
+        right_child = int.from_bytes(internal_node_right_child(node), "little")
+        internal_header_fields = [
+            _memory_field(
+                "num_keys",
+                "Num Keys",
+                f"Number of separator keys (max {INTERNAL_NODE_MAX_CELLS})",
+                INTERNAL_NODE_NUM_KEYS_OFFSET,
+                INTERNAL_NODE_NUM_KEYS_SIZE,
+                internal_node_num_keys(node),
+                str(num_keys),
+            ),
+            _memory_field(
+                "right_child",
+                "Right Child Page",
+                "Page pointer to the rightmost child",
+                INTERNAL_NODE_RIGHT_CHILD_OFFSET,
+                INTERNAL_NODE_RIGHT_CHILD_SIZE,
+                internal_node_right_child(node),
+                _format_page_num(right_child),
+            ),
+        ]
+        sections.append({
+            "title": "Internal Node Header",
+            "offset": COMMON_NODE_HEADER_SIZE,
+            "size": INTERNAL_NODE_HEADER_SIZE - COMMON_NODE_HEADER_SIZE,
+            "fields": internal_header_fields,
+        })
+
+        for key_index in range(num_keys):
+            cell_offset = INTERNAL_NODE_HEADER_SIZE + key_index * INTERNAL_NODE_CELL_SIZE
+            child_page = int.from_bytes(
+                internal_node_child(node, key_index)[INTERNAL_NODE_CHILD_OFFSET:INTERNAL_NODE_CHILD_OFFSET + INTERNAL_NODE_CHILD_SIZE],
+                "little",
+            )
+            separator_key = int.from_bytes(internal_node_key(node, key_index), "little")
+            cell_fields = [
+                _memory_field(
+                    f"cell_{key_index}_child",
+                    "Left Child Page",
+                    f"Child page to the left of separator key {key_index}",
+                    cell_offset + INTERNAL_NODE_CHILD_OFFSET,
+                    INTERNAL_NODE_CHILD_SIZE,
+                    internal_node_child(node, key_index)[INTERNAL_NODE_CHILD_OFFSET:INTERNAL_NODE_CHILD_OFFSET + INTERNAL_NODE_CHILD_SIZE],
+                    _format_page_num(child_page),
+                ),
+                _memory_field(
+                    f"cell_{key_index}_key",
+                    "Separator Key",
+                    "Routing key — all keys in left subtree are less than this value",
+                    cell_offset + INTERNAL_NODE_KEY_OFFSET,
+                    INTERNAL_NODE_KEY_SIZE,
+                    internal_node_key(node, key_index),
+                    str(separator_key),
+                ),
+            ]
+            sections.append({
+                "title": f"Internal Cell {key_index}",
+                "offset": cell_offset,
+                "size": INTERNAL_NODE_CELL_SIZE,
+                "fields": cell_fields,
+            })
+
+    memory_layout = (
+        _build_leaf_memory_layout(node, int.from_bytes(leaf_node_num_cells(node), "little"))
+        if node_kind == "leaf"
+        else _build_internal_memory_layout(node, int.from_bytes(internal_node_num_keys(node), "little"))
+    )
+
+    return json.dumps({
+        "page": page_num,
+        "pageSize": PAGE_SIZE,
+        "nodeKind": node_kind,
+        "headerSize": LEAF_NODE_HEADER_SIZE if node_kind == "leaf" else INTERNAL_NODE_HEADER_SIZE,
+        "sections": sections,
+        "memoryLayout": memory_layout,
+    })
